@@ -7,6 +7,22 @@ import { buildBookReadPath, cacheBookReadRecord, cacheBookShelfItem } from '@/li
 import { deleteBookReadRecord, getAllBookReadRecords, getAllBookShelf } from '@/lib/book.db.client';
 import { BookReadRecord, BookShelfItem } from '@/lib/book.types';
 
+
+function looksLikeInternalHref(value?: string) {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return /\.(xhtml|html|htm|xml)(#.*)?$/.test(normalized) || /^nav/.test(normalized);
+}
+
+function getReadableChapterLabel(item: BookReadRecord) {
+  const candidates = [item.chapterTitle, item.locator.chapterTitle];
+  for (const candidate of candidates) {
+    const text = (candidate || '').trim();
+    if (text && !looksLikeInternalHref(text)) return text;
+  }
+  return '定位已保存';
+}
+
 export default function BookHistoryPage() {
   const [records, setRecords] = useState<Record<string, BookReadRecord>>({});
   const [shelf, setShelf] = useState<Record<string, BookShelfItem>>({});
@@ -44,7 +60,7 @@ export default function BookHistoryPage() {
             <div className='min-w-0 flex-1'>
               <div className='truncate font-medium'>{item.title}</div>
               <div className='mt-1 text-sm text-gray-500'>{item.author || item.sourceName}</div>
-              <div className='mt-1 text-xs text-gray-500'>已读 {Math.round(item.progressPercent || 0)}% · {item.chapterTitle || item.locator.chapterTitle || '定位已保存'}</div>
+              <div className='mt-1 text-xs text-gray-500'>已读 {Math.round(item.progressPercent || 0)}% · {getReadableChapterLabel(item)}</div>
               <div className='mt-3 flex flex-wrap gap-2'>
                 {item.sourceId ? (
                   <Link

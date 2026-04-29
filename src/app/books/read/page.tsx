@@ -3,6 +3,7 @@
 import { BookOpen, List, Moon, Settings2, Sun } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import {
   buildBookCacheKey,
@@ -13,7 +14,7 @@ import {
 } from '@/lib/book-cache.client';
 import { cacheBookDetail, getBookRouteCache } from '@/lib/book-route-cache.client';
 import { saveBookReadRecord } from '@/lib/book.db.client';
-import { BookReadManifest } from '@/lib/book.types';
+import { BookReadManifest, BookReadRecord } from '@/lib/book.types';
 
 declare global {
   interface Window {
@@ -82,6 +83,7 @@ const DEFAULT_SETTINGS: ReaderSettings = {
   lineHeight: 1.7,
   theme: 'light',
 };
+const SAVE_INTERVAL_MS = 10000;
 
 const THEME_STYLES: Record<ReaderTheme, { bodyBg: string; bodyColor: string; panelBg: string }> = {
   light: { bodyBg: '#ffffff', bodyColor: '#111827', panelBg: '#ffffff' },
@@ -139,6 +141,19 @@ function loadReaderSettings(): ReaderSettings {
 
 function flattenToc(items: TocItem[]): TocItem[] {
   return items.flatMap((item) => [item, ...flattenToc(item.subitems || [])]);
+}
+
+function tocItemIsActive(item: TocItem, currentHref: string): boolean {
+  return isSameTocTarget(currentHref, item.href) || (item.subitems || []).some((subitem) => tocItemIsActive(subitem, currentHref));
+}
+
+function findTocLabelByHref(items: TocItem[], currentHref: string): string {
+  for (const item of items) {
+    if (isSameTocTarget(currentHref, item.href)) return item.label;
+    const nested = findTocLabelByHref(item.subitems || [], currentHref);
+    if (nested) return nested;
+  }
+  return '';
 }
 
 async function downloadBookWithProgress(
@@ -235,11 +250,14 @@ export default function BookReadPage() {
   const tocItemRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const bookRef = useRef<EpubBookInstance | null>(null);
   const renditionRef = useRef<EpubRendition | null>(null);
-  const saveTimerRef = useRef<number | null>(null);
+  const pendingRecordRef = useRef<BookReadRecord | null>(null);
+  const pendingRecordDirtyRef = useRef(false);
+  const saveInFlightRef = useRef(false);
   const lastLocationRef = useRef<EpubLocation | null>(null);
   const lastProgressRef = useRef(0);
   const lastChapterRef = useRef('');
   const locationsReadyRef = useRef(false);
+  const tocItemsRef = useRef<TocItem[]>([]);
 
   useEffect(() => {
     setSettings(loadReaderSettings());
@@ -303,40 +321,65 @@ export default function BookReadPage() {
       .catch((err) => setError(err.message || '获取阅读信息失败'));
   }, [sourceId, bookId, cached]);
 
-  const saveProgress = useMemo(() => {
-    return async (location: EpubLocation, nextProgress = 0, chapterTitle?: string) => {
-      if (!manifest) return;
-      const locatorValue = location?.start?.cfi || location?.end?.cfi || '';
-      if (!locatorValue) return;
-      await saveBookReadRecord(manifest.book.sourceId, manifest.book.id, {
-        sourceId: manifest.book.sourceId,
-        sourceName: manifest.book.sourceName,
-        bookId: manifest.book.id,
-        title: manifest.book.title,
-        author: manifest.book.author,
-        cover: manifest.book.cover,
-        detailHref: manifest.book.detailHref,
-        acquisitionHref: manifest.acquisitionHref,
-        format: manifest.format,
-        locator: {
-          type: 'epub-cfi',
-          value: locatorValue,
-          href: location?.start?.href,
-          chapterTitle,
-        },
+  const buildReadRecord = useCallback((location: EpubLocation, nextProgress = 0, chapterTitle?: string): BookReadRecord | null => {
+    if (!manifest) return null;
+    const locatorValue = location?.start?.cfi || location?.end?.cfi || '';
+    if (!locatorValue) return null;
+    return {
+      sourceId: manifest.book.sourceId,
+      sourceName: manifest.book.sourceName,
+      bookId: manifest.book.id,
+      title: manifest.book.title,
+      author: manifest.book.author,
+      cover: manifest.book.cover,
+      detailHref: manifest.book.detailHref,
+      acquisitionHref: manifest.acquisitionHref,
+      format: manifest.format,
+      locator: {
+        type: 'epub-cfi',
+        value: locatorValue,
+        href: location?.start?.href,
         chapterTitle,
-        chapterHref: location?.start?.href,
-        progressPercent: nextProgress,
-        saveTime: Date.now(),
-      });
+      },
+      chapterTitle,
+      chapterHref: location?.start?.href,
+      progressPercent: nextProgress,
+      saveTime: Date.now(),
     };
   }, [manifest]);
 
+  const queueReadRecord = useCallback((location: EpubLocation, nextProgress = 0, chapterTitle?: string) => {
+    const record = buildReadRecord(location, nextProgress, chapterTitle);
+    if (!record) return;
+    pendingRecordRef.current = record;
+    pendingRecordDirtyRef.current = true;
+  }, [buildReadRecord]);
+
+  const flushPendingReadRecord = useCallback(async () => {
+    const record = pendingRecordRef.current;
+    if (!record || !pendingRecordDirtyRef.current || saveInFlightRef.current) return;
+
+    saveInFlightRef.current = true;
+    try {
+      await saveBookReadRecord(record.sourceId, record.bookId, {
+        ...record,
+        saveTime: Date.now(),
+      });
+      pendingRecordRef.current = { ...record, saveTime: Date.now() };
+      pendingRecordDirtyRef.current = false;
+    } catch {
+      // ignore
+    } finally {
+      saveInFlightRef.current = false;
+    }
+  }, []);
+
   const persistCurrentProgress = useCallback(() => {
     if (lastLocationRef.current) {
-      void saveProgress(lastLocationRef.current, lastProgressRef.current, lastChapterRef.current);
+      queueReadRecord(lastLocationRef.current, lastProgressRef.current, lastChapterRef.current);
     }
-  }, [saveProgress]);
+    void flushPendingReadRecord();
+  }, [queueReadRecord, flushPendingReadRecord]);
 
   const applyReaderTheme = useCallback((nextSettings: ReaderSettings) => {
     const rendition = renditionRef.current;
@@ -380,6 +423,9 @@ export default function BookReadPage() {
     setTocOpen(false);
     setSettingsOpen(false);
   }, [ready]);
+
+
+
 
 
 
@@ -477,7 +523,8 @@ export default function BookReadPage() {
             window.setTimeout(() => setRestoredMessage(''), 3000);
           }
           lastLocationRef.current = location;
-          const chapterTitle = location?.start?.displayed?.chapter || location?.start?.href || manifest.book.title;
+          const hrefLabel = location?.start?.href ? findTocLabelByHref(tocItemsRef.current, location.start.href) : '';
+          const chapterTitle = hrefLabel || location?.start?.displayed?.chapter || location?.start?.href || manifest.book.title;
           const cfi = location?.start?.cfi || '';
           const computedProgress = locationsReadyRef.current && cfi
             ? Math.max(0, Math.min(100, (book.locations?.percentageFromCfi?.(cfi) || 0) * 100))
@@ -488,10 +535,7 @@ export default function BookReadPage() {
           setCurrentHref(location?.start?.href || '');
           lastProgressRef.current = normalizedProgress;
           lastChapterRef.current = chapterTitle;
-          if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-          saveTimerRef.current = window.setTimeout(() => {
-            void saveProgress(location, normalizedProgress, chapterTitle);
-          }, locationsReadyRef.current ? 1500 : 3500);
+          queueReadRecord(location, normalizedProgress, chapterTitle);
         });
 
         void navigateToTarget(restoreTarget).catch(() => {
@@ -533,25 +577,37 @@ export default function BookReadPage() {
 
     return () => {
       destroyed = true;
-      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
       persistCurrentProgress();
       renditionRef.current?.destroy?.();
       bookRef.current?.destroy?.();
     };
-  }, [manifest, settings, applyReaderTheme, persistCurrentProgress, saveProgress, navigateToTarget]);
+  }, [manifest, settings, applyReaderTheme, persistCurrentProgress, queueReadRecord, navigateToTarget]);
 
   useEffect(() => {
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') persistCurrentProgress();
+    const flushPendingReadRecordOnLeave = () => {
+      if (!pendingRecordDirtyRef.current || saveInFlightRef.current) return;
+      persistCurrentProgress();
     };
-    const handleUnload = () => persistCurrentProgress();
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('beforeunload', handleUnload);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingReadRecordOnLeave();
+      }
+    };
+
+    const intervalId = window.setInterval(() => {
+      void flushPendingReadRecord();
+    }, SAVE_INTERVAL_MS);
+    window.addEventListener('pagehide', flushPendingReadRecordOnLeave);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('beforeunload', handleUnload);
+      window.clearInterval(intervalId);
+      window.removeEventListener('pagehide', flushPendingReadRecordOnLeave);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [persistCurrentProgress]);
+  }, [flushPendingReadRecord, persistCurrentProgress]);
+
 
 
   useEffect(() => {
@@ -588,15 +644,8 @@ export default function BookReadPage() {
 
 
   useEffect(() => {
-    if (!manifest) return;
-    window.dispatchEvent(new CustomEvent('books-read-update-header', {
-      detail: {
-        title: manifest.book.title,
-        subtitle: currentChapter || manifest.book.author || '分页阅读',
-        backHref: `/books/detail?sourceId=${encodeURIComponent(manifest.book.sourceId)}&bookId=${encodeURIComponent(manifest.book.id)}`,
-      },
-    }));
-  }, [manifest, currentChapter]);
+    tocItemsRef.current = tocItems;
+  }, [tocItems]);
 
   const flatToc = useMemo(() => flattenToc(tocItems), [tocItems]);
   const activeTocHref = useMemo(
@@ -604,12 +653,53 @@ export default function BookReadPage() {
     [flatToc, currentHref]
   );
 
+  const currentTocLabel = useMemo(() => findTocLabelByHref(tocItems, currentHref), [tocItems, currentHref]);
+
+  useEffect(() => {
+    if (!manifest) return;
+    window.dispatchEvent(new CustomEvent('books-read-update-header', {
+      detail: {
+        title: manifest.book.title,
+        subtitle: currentTocLabel || currentChapter || manifest.book.author || '分页阅读',
+        backHref: `/books/detail?sourceId=${encodeURIComponent(manifest.book.sourceId)}&bookId=${encodeURIComponent(manifest.book.id)}`,
+      },
+    }));
+  }, [manifest, currentChapter, currentTocLabel]);
+
   useEffect(() => {
     if (!tocOpen || !activeTocHref) return;
     const activeNode = tocItemRefs.current[activeTocHref];
     if (!activeNode) return;
     activeNode.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }, [tocOpen, activeTocHref]);
+
+  const renderTocItems = useCallback((items: TocItem[], depth = 0) => items.map((item) => {
+    const active = tocItemIsActive(item, currentHref);
+    const clickable = !!item.href;
+    return (
+      <div key={`${item.href || item.label}-${depth}`} className='space-y-2'>
+        <button
+          ref={(node) => {
+            if (item.href) tocItemRefs.current[item.href] = node;
+          }}
+          onClick={() => {
+            if (!clickable) return;
+            void navigateToTarget(item.href);
+            setTocOpen(false);
+          }}
+          disabled={!clickable}
+          className={`group relative block w-full rounded-2xl px-4 py-3 text-left text-sm transition ${active ? 'bg-sky-600 text-white' : 'text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900'} ${!clickable ? 'cursor-default opacity-80' : ''}`}
+          style={{ paddingLeft: `${16 + depth * 14}px` }}
+        >
+          <span className='block truncate'>{item.label}</span>
+          <div className='pointer-events-none absolute bottom-full left-1/2 z-[100] mb-2 -translate-x-1/2 rounded-lg bg-gray-800 px-3 py-2 text-sm text-white opacity-0 invisible shadow-xl transition-all duration-200 ease-out group-hover:visible group-hover:opacity-100 dark:bg-gray-900 whitespace-nowrap'>
+            <div className='text-sm'>{item.label}</div>
+          </div>
+        </button>
+        {item.subitems?.length ? renderTocItems(item.subitems, depth + 1) : null}
+      </div>
+    );
+  }), [currentHref, navigateToTarget]);
 
   const progressLabel = totalBytes ? `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}` : formatBytes(downloadedBytes);
 
@@ -664,47 +754,27 @@ export default function BookReadPage() {
         </div>
       ) : null}
 
-      {tocOpen && (
+      {tocOpen && typeof document !== 'undefined' ? createPortal(
         <div className='fixed inset-0 z-40 bg-black/30' onClick={() => setTocOpen(false)}>
           <div
-            className='absolute right-0 top-0 h-[calc(100vh-3.5rem)] w-full max-w-sm overflow-y-auto border-l border-gray-200 bg-white shadow-xl dark:border-gray-700 dark:bg-gray-950'
+            className='absolute right-0 top-0 h-screen w-[22rem] max-w-[88vw] overflow-y-auto border-l border-gray-200 bg-white shadow-xl dark:border-gray-700 dark:bg-gray-950'
             onClick={(event) => event.stopPropagation()}
           >
             <div className='p-4'>
-              <div className='mb-3 flex items-center justify-between'>
-                <div className='flex items-center gap-2 text-sm font-medium text-gray-900 dark:text-gray-100'><BookOpen className='h-4 w-4' />目录</div>
-                <button onClick={() => setTocOpen(false)} className='text-xs text-gray-500'>关闭</button>
-              </div>
-              <div ref={tocScrollRef} className='space-y-2'>
-                {flatToc.length === 0 ? (
+              <div className='space-y-2' ref={tocScrollRef}>
+                {tocItems.length === 0 ? (
                   <div className='p-3 text-sm text-gray-500'>当前 EPUB 未提供目录</div>
                 ) : (
-                  flatToc.map((item) => {
-                    const active = activeTocHref === item.href;
-                    return (
-                      <button
-                        key={`${item.href}-${item.label}`}
-                        ref={(node) => {
-                          tocItemRefs.current[item.href] = node;
-                        }}
-                        onClick={() => {
-                          void navigateToTarget(item.href);
-                          setTocOpen(false);
-                        }}
-                        className={`block w-full rounded-2xl px-4 py-3 text-left text-sm transition ${active ? 'bg-sky-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900'}`}
-                      >
-                        {item.label}
-                      </button>
-                    );
-                  })
+                  renderTocItems(tocItems)
                 )}
               </div>
             </div>
           </div>
-        </div>
-      )}
+        </div>,
+        document.body
+      ) : null}
 
-      {settingsOpen && (
+      {settingsOpen && typeof document !== 'undefined' ? createPortal(
         <div className='fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-4' onClick={() => setSettingsOpen(false)}>
           <div
             className='w-full max-w-sm rounded-3xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-700 dark:bg-gray-950'
@@ -757,16 +827,24 @@ export default function BookReadPage() {
               </div>
             </div>
           </div>
-        </div>
-      )}
+        </div>,
+        document.body
+      ) : null}
 
 
       {ready && !tocOpen && !settingsOpen ? (
-        <div className='absolute inset-0 z-10 grid grid-cols-3'>
-          <button aria-label='上一页' className='h-full w-full cursor-pointer bg-transparent' onClick={() => handleReaderTap('left')} />
-          <button aria-label='切换工具栏' className='h-full w-full cursor-pointer bg-transparent' onClick={() => handleReaderTap('center')} />
-          <button aria-label='下一页' className='h-full w-full cursor-pointer bg-transparent' onClick={() => handleReaderTap('right')} />
-        </div>
+        <>
+          <button
+            aria-label='上一页'
+            className='absolute inset-y-0 left-0 z-10 w-[28%] cursor-pointer bg-transparent'
+            onClick={() => handleReaderTap('left')}
+          />
+          <button
+            aria-label='下一页'
+            className='absolute inset-y-0 right-0 z-10 w-[28%] cursor-pointer bg-transparent'
+            onClick={() => handleReaderTap('right')}
+          />
+        </>
       ) : null}
 
       <div ref={viewerRef} className='h-full w-full' style={{ backgroundColor: THEME_STYLES[settings.theme].panelBg }} />

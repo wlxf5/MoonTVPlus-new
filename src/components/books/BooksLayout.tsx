@@ -82,8 +82,9 @@ export default function BooksLayout({ children }: { children: React.ReactNode })
           <div className='min-w-0 flex-1'>
             <div className='group relative'>
               <div className='truncate text-sm font-semibold sm:text-base'>{meta.title}</div>
-              <div className='absolute left-1/2 top-full z-[100] mt-2 w-max max-w-[85vw] -translate-x-1/2 rounded-lg bg-gray-800 px-3 py-2 text-center text-sm text-white opacity-0 invisible shadow-xl transition-all duration-200 ease-out pointer-events-none group-hover:visible group-hover:opacity-100 dark:bg-gray-900 sm:max-w-none sm:whitespace-nowrap'>
-                <div className='break-words whitespace-normal sm:whitespace-nowrap'>{meta.title}</div>
+              <div className='absolute left-1/2 top-full z-[100] mt-2 w-max max-w-[85vw] -translate-x-1/2 rounded-lg bg-gray-800 px-3 py-2 text-center text-sm text-white opacity-0 invisible shadow-xl transition-all duration-200 ease-out pointer-events-none group-hover:visible group-hover:opacity-100 dark:bg-gray-900'>
+                <div className='max-w-[85vw] break-words whitespace-normal sm:max-w-none sm:whitespace-nowrap'>{meta.title}</div>
+                {meta.subtitle ? <div className='mt-1 max-w-[85vw] break-words whitespace-normal text-xs text-gray-300 sm:max-w-none sm:whitespace-nowrap'>{meta.subtitle}</div> : null}
               </div>
             </div>
             <div className='truncate text-xs text-gray-500 dark:text-gray-400'>{meta.subtitle}</div>
