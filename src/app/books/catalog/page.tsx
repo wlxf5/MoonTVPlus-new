@@ -74,7 +74,9 @@ export default function BooksCatalogPage() {
   const loaderRef = useRef<HTMLDivElement | null>(null);
   const navScrollerRef = useRef<HTMLDivElement | null>(null);
   const loadedPageHrefsRef = useRef<Set<string>>(new Set());
-  const navDragStateRef = useRef<{ pointerId: number; startX: number; startScrollLeft: number; moved: boolean } | null>(null);
+  const failedPageHrefsRef = useRef<Set<string>>(new Set());
+  const navDragStateRef = useRef<{ pointerId: number; startX: number; startScrollLeft: number; moved: boolean; pointerType: string } | null>(null);
+  const suppressNavClickRef = useRef(false);
 
   useEffect(() => {
     fetch('/api/books/sources').then((res) => res.json()).then((json) => setSources(json.sources || []));
@@ -97,7 +99,7 @@ export default function BooksCatalogPage() {
     if (!sourceId) return;
     const normalizedHref = targetHref || '';
     if (append) {
-      if (!normalizedHref || loadedPageHrefsRef.current.has(normalizedHref)) return;
+      if (!normalizedHref || loadedPageHrefsRef.current.has(normalizedHref) || failedPageHrefsRef.current.has(normalizedHref)) return;
       setLoadingMore(true);
     } else {
       setError('');
@@ -105,6 +107,7 @@ export default function BooksCatalogPage() {
       setEntries([]);
       setNextHref(undefined);
       loadedPageHrefsRef.current = new Set(normalizedHref ? [normalizedHref] : ['__root__']);
+      failedPageHrefsRef.current = new Set();
     }
 
     try {
@@ -124,6 +127,10 @@ export default function BooksCatalogPage() {
       setNextHref(nextData.nextHref || undefined);
       if (!append) setData(nextData);
     } catch (err) {
+      if (append && normalizedHref) {
+        failedPageHrefsRef.current.add(normalizedHref);
+        setNextHref(undefined);
+      }
       setError(err instanceof Error ? err.message : '获取目录失败');
     } finally {
       setLoadingMore(false);
@@ -152,6 +159,7 @@ export default function BooksCatalogPage() {
 
 
   const handleNavPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
     const node = navScrollerRef.current;
     if (!node) return;
     navDragStateRef.current = {
@@ -159,8 +167,12 @@ export default function BooksCatalogPage() {
       startX: event.clientX,
       startScrollLeft: node.scrollLeft,
       moved: false,
+      pointerType: event.pointerType,
     };
-    node.setPointerCapture?.(event.pointerId);
+    suppressNavClickRef.current = false;
+    if (event.pointerType !== 'mouse') {
+      node.setPointerCapture?.(event.pointerId);
+    }
   }, []);
 
   const handleNavPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -168,7 +180,11 @@ export default function BooksCatalogPage() {
     const dragState = navDragStateRef.current;
     if (!node || !dragState || dragState.pointerId !== event.pointerId) return;
     const deltaX = event.clientX - dragState.startX;
-    if (Math.abs(deltaX) > 4) dragState.moved = true;
+    const moveThreshold = dragState.pointerType === 'mouse' ? 8 : 4;
+    if (Math.abs(deltaX) > moveThreshold) {
+      dragState.moved = true;
+      suppressNavClickRef.current = true;
+    }
     node.scrollLeft = dragState.startScrollLeft - deltaX;
   }, []);
 
@@ -179,13 +195,19 @@ export default function BooksCatalogPage() {
     if (dragState.moved) {
       event.preventDefault();
       window.setTimeout(() => {
-        navDragStateRef.current = null;
+        suppressNavClickRef.current = false;
       }, 0);
-    } else {
-      navDragStateRef.current = null;
     }
-    node?.releasePointerCapture?.(event.pointerId);
+    navDragStateRef.current = null;
+    if (dragState.pointerType !== 'mouse') {
+      node?.releasePointerCapture?.(event.pointerId);
+    }
   }, []);
+
+  const handleNavPointerLeave = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'mouse') return;
+    handleNavPointerUp(event);
+  }, [handleNavPointerUp]);
 
   const handleNavWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
     const node = navScrollerRef.current;
@@ -193,7 +215,6 @@ export default function BooksCatalogPage() {
     const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
     if (!delta) return;
     node.scrollLeft += delta;
-    event.preventDefault();
   }, []);
 
   const navigationItems = useMemo(() => {
@@ -234,22 +255,27 @@ export default function BooksCatalogPage() {
               <div
                 ref={navScrollerRef}
                 className='flex gap-3 overflow-x-auto pb-2 cursor-grab select-none touch-pan-x active:cursor-grabbing'
-                onPointerDown={handleNavPointerDown}
-                onPointerMove={handleNavPointerMove}
-                onPointerUp={handleNavPointerUp}
-                onPointerCancel={handleNavPointerUp}
-                onPointerLeave={handleNavPointerUp}
-                onWheel={handleNavWheel}
-              >
+                 onPointerDown={handleNavPointerDown}
+                 onPointerMove={handleNavPointerMove}
+                 onPointerUp={handleNavPointerUp}
+                 onPointerCancel={handleNavPointerUp}
+                 onPointerLeave={handleNavPointerLeave}
+                 onWheel={handleNavWheel}
+               >
                 {navigationItems.map((item, index) => (
                   <Link
-                    key={`${item.href}-${index}`}
-                    href={`/books/catalog?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(item.href)}`}
-                    draggable={false}
-                    onDragStart={(event) => event.preventDefault()}
-                    onClick={(event) => { if (navDragStateRef.current?.moved) event.preventDefault(); }}
-                    className='min-w-[180px] rounded-2xl border border-gray-200 bg-white p-4 text-sm shadow-sm dark:border-gray-800 dark:bg-gray-950'
-                  >
+                     key={`${item.href}-${index}`}
+                     href={`/books/catalog?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(item.href)}`}
+                     draggable={false}
+                     onDragStart={(event) => event.preventDefault()}
+                     onClick={(event) => {
+                       if (suppressNavClickRef.current) {
+                         event.preventDefault();
+                         suppressNavClickRef.current = false;
+                       }
+                     }}
+                     className='min-w-[180px] rounded-2xl border border-gray-200 bg-white p-4 text-sm shadow-sm dark:border-gray-800 dark:bg-gray-950'
+                   >
                     <div className='line-clamp-2 font-medium'>{item.title.trim()}</div>
                     <div className='mt-2 text-xs text-gray-500 dark:text-gray-400'>点击进入子目录</div>
                   </Link>

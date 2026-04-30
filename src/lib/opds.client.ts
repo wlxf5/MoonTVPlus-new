@@ -65,6 +65,23 @@ function textValue(value: any): string {
   return '';
 }
 
+function sanitizeXmlForParsing(xml: string): string {
+  return xml
+    .replace(/^\uFEFF/, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .replace(/&(?!(?:#\d+|#x[a-fA-F0-9]+|amp|lt|gt|quot|apos);)/g, '&amp;');
+}
+
+async function parseXmlWithFallback(xml: string) {
+  try {
+    return await parseStringPromise(xml, { explicitArray: true, trim: true });
+  } catch (error) {
+    const sanitizedXml = sanitizeXmlForParsing(xml);
+    if (sanitizedXml === xml) throw error;
+    return await parseStringPromise(sanitizedXml, { explicitArray: true, trim: true });
+  }
+}
+
 function normalizeUrl(base: string, href?: string): string {
   if (!href) return base;
   return new URL(href, base).toString();
@@ -257,7 +274,7 @@ function parseEntries(value: any[], baseUrl: string): ParsedFeedEntry[] {
 }
 
 async function parseFeed(xml: string, baseUrl: string): Promise<ParsedFeed> {
-  const parsed = await parseStringPromise(xml, { explicitArray: true, trim: true });
+  const parsed = await parseXmlWithFallback(xml);
   const feed = parsed.feed || parsed.entry;
   if (!feed) throw new Error('无法解析 OPDS feed');
 
@@ -311,7 +328,7 @@ async function resolveSearchTargetUrl(source: BookSource, q: string): Promise<st
 
   if ((searchLink.type || '').toLowerCase().includes('opensearchdescription+xml')) {
     const xml = await fetchText(searchLink.href, buildHeaders(source));
-    const parsed = await parseStringPromise(xml, { explicitArray: true, trim: true });
+    const parsed = await parseXmlWithFallback(xml);
     const description = parsed.OpenSearchDescription || parsed['os:OpenSearchDescription'] || parsed['OpenSearchDescription'];
     const urlNodes = asArray(description?.Url || description?.url);
     const preferred = urlNodes.find((item) => (item?.$?.type || '').toLowerCase().includes('atom+xml')) || urlNodes[0];
